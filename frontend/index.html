@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model X-Ray — Neural Network Introspection</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div id="brand">⚡ Model X-Ray</div>
+  <div class="loader-group">
+    <select id="demo-select"></select>
+    <button id="btn-load-demo">Load demo</button>
+  </div>
+  <div class="loader-group">
+    <input id="hf-id" placeholder="HuggingFace ID e.g. sshleifer/tiny-gpt2" size="28">
+    <button id="btn-load-hf">Load HF</button>
+  </div>
+  <div class="loader-group">
+    <input type="file" id="file-input" accept=".pt,.pth,.safetensors,.bin,.ckpt">
+    <label class="chk"><input type="checkbox" id="allow-pickle"> trust pickle</label>
+    <button id="btn-upload">Upload</button>
+  </div>
+  <div id="session-info"></div>
+</header>
+
+<div id="banner" class="hidden"></div>
+
+<div id="result-strip" class="hidden">
+  <div id="rs-main">
+    <span id="rs-verdict" class="dim">run a forward pass to see the model's answer</span>
+    <span id="rs-tokens"></span>
+  </div>
+  <div id="rs-controls">
+    <span id="rs-gen-controls" class="hidden">
+      <input id="gen-n" value="12" size="3" title="tokens to generate">
+      <select id="gen-mode">
+        <option value="greedy">greedy</option>
+        <option value="sample">sample</option>
+      </select>
+      <input id="gen-temp" value="0.8" size="3" title="temperature">
+      <button id="btn-generate" class="primary">▶ generate</button>
+    </span>
+    <button id="btn-lens" class="hidden">🔬 logit lens</button>
+    <button id="btn-attr" class="hidden">🎯 attribute</button>
+    <button id="btn-dist" class="hidden">show all probabilities</button>
+    <button id="btn-report" class="hidden">📄 report</button>
+  </div>
+</div>
+<div id="attr-panel" class="hidden">
+  <div class="panel-head"><span>🎯 Input attribution — which input drove the answer</span>
+    <span>
+      <select id="attr-method">
+        <option value="saliency">saliency (gradient × input)</option>
+        <option value="ig">integrated gradients</option>
+      </select>
+      <input id="attr-contrast" size="10" placeholder="vs token…"
+        title="contrastive: attribute logit(answer) − logit(this token) — 'why X rather than Y'">
+      <button id="btn-attr-run" class="primary">run</button>
+      <button id="btn-attr-batch" title="distribution across a batch of prompts — evidence, not an anecdote">Σ batch</button>
+      <button id="btn-fragility" title="which single-token swaps flip the answer (text) / FGSM sweep (vision)">🧷 fragility</button>
+      <button id="attr-close">✕</button>
+    </span></div>
+  <div id="attr-view" style="padding:10px 14px"></div>
+</div>
+<div id="dist-panel" class="hidden">
+  <div class="panel-head"><span>Complete output distribution (softmax over <span id="dist-total"></span> entries)</span>
+    <button id="dist-close">✕</button></div>
+  <div id="dist-scroll"><div id="dist-spacer"><div id="dist-rows"></div></div></div>
+</div>
+<div id="lens-panel" class="hidden">
+  <div class="panel-head"><span>🔬 Logit lens — what each depth would predict
+    <span class="dim small">(hidden state × the model's own final norm + unembedding)</span></span>
+    <button id="lens-close">✕</button></div>
+  <div id="lens-strip"></div>
+</div>
+
+<main id="layout" class="hidden">
+  <!-- LEFT: architecture -->
+  <section id="arch-panel">
+    <div class="panel-head">
+      <span>Architecture</span>
+      <span id="arch-summary"></span>
+    </div>
+    <div id="arch-tree"></div>
+  </section>
+
+  <!-- CENTER: execution -->
+  <section id="run-panel">
+    <div class="tabs" id="run-tabs">
+      <button data-tab="forward" class="tab active">▶ Forward</button>
+      <button data-tab="backward" class="tab">◀ Backward</button>
+      <button data-tab="update" class="tab">Δ Update</button>
+      <button data-tab="graph" class="tab">⬡ Graph</button>
+      <button data-tab="patch" class="tab">🧪 Patch</button>
+      <button data-tab="edit" class="tab">✎ Edit</button>
+      <button data-tab="steer" class="tab">🧭 Steer</button>
+      <button data-tab="sae" class="tab">🧬 SAE</button>
+      <button data-tab="profile" class="tab">⏱ Profile</button>
+    </div>
+
+    <div id="tab-forward" class="tab-body">
+      <div class="controls">
+        <div id="input-text-ctl">
+          <label>Prompt</label>
+          <input id="fw-text" value="Hello world" size="30">
+        </div>
+        <div id="input-tensor-ctl">
+          <label>Input shape</label>
+          <input id="fw-shape" size="14" placeholder="1,1,28,28">
+          <select id="fw-fill">
+            <option value="randn">random normal</option>
+            <option value="zeros">zeros</option>
+            <option value="ones">ones</option>
+          </select>
+        </div>
+        <button id="btn-forward" class="primary">Run forward pass</button>
+      </div>
+      <div id="fw-result" class="hidden">
+        <div class="playback">
+          <button id="pb-first">⏮</button>
+          <button id="pb-prev">◀</button>
+          <button id="pb-play">▶ play</button>
+          <button id="pb-next">▶</button>
+          <button id="pb-last">⏭</button>
+          <input type="range" id="pb-slider" min="0" value="0">
+          <span id="pb-label"></span>
+        </div>
+        <div id="fw-step-card"></div>
+        <div id="fw-output-card"></div>
+        <div id="attn-card" class="hidden">
+          <div class="panel-head"><span>Attention weights</span>
+            <span>
+              layer <select id="attn-layer"></select>
+              head <select id="attn-head"></select>
+            </span>
+          </div>
+          <canvas id="attn-canvas" width="360" height="360"></canvas>
+          <div id="attn-tokens" class="dim small"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-backward" class="tab-body hidden">
+      <div class="controls">
+        <div>
+          <label>Target</label>
+          <select id="bw-target-kind">
+            <option value="argmax">model's own prediction (argmax)</option>
+            <option value="class">class index…</option>
+            <option value="token">next token…</option>
+          </select>
+          <input id="bw-target-value" size="10" class="hidden" placeholder="3">
+        </div>
+        <button id="btn-backward" class="primary">Run backward pass</button>
+      </div>
+      <div id="bw-result" class="hidden">
+        <div id="bw-loss-card"></div>
+        <div class="panel-head"><span>Gradient magnitude per layer</span>
+          <span class="dim small">‖∇‖ · execution-reverse order · click a bar to inspect</span></div>
+        <div id="grad-bars"></div>
+        <div id="grad-diagnosis" class="note"></div>
+      </div>
+    </div>
+
+    <div id="tab-update" class="tab-body hidden">
+      <div class="controls">
+        <select id="opt-name">
+          <option value="sgd">SGD</option>
+          <option value="sgd_momentum">SGD + momentum</option>
+          <option value="adam">Adam</option>
+        </select>
+        <label>lr</label><input id="opt-lr" value="0.01" size="8">
+        <button id="btn-step" class="primary">Apply one optimizer step</button>
+        <button id="btn-undo">Undo step</button>
+      </div>
+      <div id="step-result" class="hidden">
+        <div id="step-summary"></div>
+        <div class="panel-head"><span>Weight changes per parameter</span>
+          <span class="dim small">click a row for before/after/Δ heatmaps</span></div>
+        <div id="step-table"></div>
+        <div id="diff-view" class="hidden"></div>
+      </div>
+
+      <div class="panel-head" style="margin-top:14px"><span>🔁 Training loop</span>
+        <span class="dim small">the single-step machinery above, looped — pause any time and inspect</span></div>
+      <div class="controls">
+        <label>steps</label><input id="train-steps" value="60" size="4">
+        <label>checkpoint every</label><input id="train-ck" value="10" size="3">
+        <span id="train-corpus-wrap" class="hidden">
+          <label>corpus</label>
+          <input id="train-corpus" size="28" placeholder="(default: pangram corpus)">
+        </span>
+        <span class="dim small">uses the optimizer + lr selected above</span>
+        <button id="btn-train" class="primary">▶ train</button>
+      </div>
+      <div id="train-result" class="hidden">
+        <div id="train-status" class="dim small" style="margin:4px 0"></div>
+        <div id="train-curve"></div>
+        <div class="controls" id="train-scrub-wrap" style="display:none">
+          <label>scrub checkpoints</label>
+          <input type="range" id="train-scrub" min="0" max="0" value="0" style="flex:1">
+          <span id="train-scrub-label"></span>
+          <button id="btn-train-restore">restore this checkpoint</button>
+          <button id="btn-train-diff">diff vs current weights</button>
+        </div>
+        <div id="train-diff-view"></div>
+      </div>
+    </div>
+    <div id="tab-graph" class="tab-body hidden">
+      <div class="controls" id="graph-controls">
+        <div class="mode-chips" id="graph-modes">
+          <button data-mode="structure" class="chip active">structure</button>
+          <button data-mode="activation" class="chip" disabled>activations</button>
+          <button data-mode="gradient" class="chip" disabled>gradients</button>
+          <button data-mode="update" class="chip" disabled>updates</button>
+          <button data-mode="time" class="chip" disabled>time</button>
+        </div>
+        <span class="dim small">·</span>
+        <button id="pb2-first">⏮</button>
+        <button id="pb2-prev">◀</button>
+        <button id="pb2-play">▶ play</button>
+        <button id="pb2-next">▶</button>
+        <button id="pb2-last">⏭</button>
+        <select id="pb2-dir">
+          <option value="forward">▶ forward flow</option>
+          <option value="backward" disabled>◀ backward flow</option>
+        </select>
+        <input type="range" id="pb2-slider" min="0" value="0" style="flex:1;min-width:120px">
+        <span id="pb2-label" class="dim small"></span>
+      </div>
+      <div id="graph-empty" class="dim" style="padding:20px">
+        Run a forward pass (or load a demo/HF model) to build the dataflow graph.
+      </div>
+      <div id="graph-wrap" class="hidden">
+        <div class="heat-caption" style="margin:0 0 4px">
+          true dataflow from the last real execution · scroll to zoom, drag to pan ·
+          click a node to inspect · click a ×N block to expand ·
+          <span class="dashed-hint">dashed</span> = module re-entered (loop/reuse)
+        </div>
+        <svg id="graph-svg"></svg>
+      </div>
+    </div>
+    <div id="tab-patch" class="tab-body hidden">
+      <div class="controls" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="min-width:70px">clean</label>
+          <input id="patch-clean" style="flex:1" placeholder="The city of Paris is located in the country of">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="min-width:70px">corrupted</label>
+          <input id="patch-corr" style="flex:1" placeholder="The city of Rome is located in the country of">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label>target token</label>
+          <input id="patch-target" size="10" placeholder="(clean top-1)">
+          <label>patch positions</label>
+          <select id="patch-pos">
+            <option value="diff">where prompts differ (causal tracing)</option>
+            <option value="last">last token only</option>
+            <option value="all">all positions (sanity: restores fully)</option>
+          </select>
+          <button id="btn-patch" class="primary">Run patch sweep</button>
+        </div>
+        <div class="dim small">Runs clean + corrupted, then re-runs corrupted once per block with the
+          clean activation spliced in at the chosen positions. Both prompts must tokenize to the same length.</div>
+      </div>
+      <div id="patch-result" class="hidden">
+        <div id="patch-summary"></div>
+        <div class="panel-head"><span>Restoration of target probability per patched layer</span>
+          <span class="dim small">1.0 = patching here fully recovers the clean answer · click to inspect</span></div>
+        <div id="patch-bars"></div>
+      </div>
+
+      <div class="panel-head" style="margin-top:14px"><span>🔬 Automated circuit discovery</span>
+        <span class="dim small">patches every layer AND every attention head individually</span></div>
+      <div class="controls">
+        <button id="btn-circuit" class="primary">Discover circuit (layer × head sweep)</button>
+        <span id="circuit-progress" class="dim small"></span>
+      </div>
+      <div id="circuit-result" class="hidden">
+        <div class="heat-caption">rows = layers (execution order) · first wide column = whole-layer patch
+          (identical to the sweep above) · remaining columns = one attention head each ·
+          brightness = restoration of the clean answer</div>
+        <canvas id="circuit-grid"></canvas>
+        <div class="controls" style="margin-top:8px">
+          <label>threshold</label>
+          <input type="range" id="circuit-thresh" min="5" max="95" value="50">
+          <span id="circuit-thresh-label">50%</span>
+          <button id="btn-circuit-overlay" class="primary">overlay circuit on ⬡ graph</button>
+          <button id="btn-circuit-clear">clear overlay</button>
+        </div>
+        <div id="circuit-members" class="dim small" style="padding:4px 2px"></div>
+      </div>
+    </div>
+    <div id="tab-edit" class="tab-body hidden">
+      <div class="controls" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span>editing:</span><code id="edit-target">(select a layer in the tree or graph)</code>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button id="btn-edit-remove">remove → Identity</button>
+          <span class="dim">·</span>
+          <select id="edit-act">
+            <option value="relu">ReLU</option><option value="gelu">GELU</option>
+            <option value="tanh">Tanh</option><option value="sigmoid">Sigmoid</option>
+          </select>
+          <button id="btn-edit-swap">swap activation</button>
+          <span class="dim">·</span>
+          <label class="chk"><input type="radio" name="dup-init" value="copy" checked> copy weights</label>
+          <label class="chk"><input type="radio" name="dup-init" value="random"> random init</label>
+          <button id="btn-edit-dup">duplicate</button>
+          <span class="dim">·</span>
+          <button id="btn-edit-up">move ↑</button>
+          <button id="btn-edit-down">move ↓</button>
+        </div>
+        <div class="dim small">Every edit mutates the live model, is validated by a real forward pass
+          (a breaking edit auto-reverts), and is diffed against the pre-edit model below.</div>
+      </div>
+      <div id="edit-history" class="hidden">
+        <div class="panel-head"><span>Edit history</span><button id="btn-edit-undo">undo last edit</button></div>
+        <div id="edit-history-list" style="padding:8px 12px;font-family:var(--mono);font-size:11.5px"></div>
+      </div>
+      <div id="edit-compare"></div>
+      <div class="panel-head" style="margin-top:14px"><span>Model diff — compare against another checkpoint of the same architecture</span></div>
+      <div class="controls">
+        <input id="mdiff-ref" size="34" placeholder="HF id or server path (e.g. distilgpt2)">
+        <label class="chk"><input type="checkbox" id="mdiff-pickle"> trust pickle</label>
+        <button id="btn-mdiff">diff checkpoints</button>
+      </div>
+      <div id="mdiff-result"></div>
+    </div>
+
+    <div id="tab-steer" class="tab-body hidden">
+      <div class="controls" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="min-width:70px">prompt A</label>
+          <input id="steer-a" style="flex:1" placeholder="I love this movie, it is wonderful">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="min-width:70px">prompt B</label>
+          <input id="steer-b" style="flex:1" placeholder="I hate this movie, it is terrible">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label>layer</label><code id="steer-layer">(select a block in the tree/graph)</code>
+          <button id="btn-steer-dir" class="primary">build direction (A − B)</button>
+          <span id="steer-dir-info" class="dim small"></span>
+        </div>
+        <div class="dim small">The direction is the difference of this layer's residual-stream
+          activations for the two prompts — captured by the same hooks patching uses. Steering adds
+          α × direction during a real forward pass on a different prompt.</div>
+      </div>
+      <div id="steer-run" class="hidden">
+        <div class="controls">
+          <label>test prompt</label>
+          <input id="steer-prompt" size="34" value="The movie was">
+          <label>watch tokens</label>
+          <input id="steer-watch" size="18" placeholder=" great, terrible">
+          <label>α</label>
+          <input type="range" id="steer-alpha" min="-10" max="10" step="0.5" value="0" style="width:180px">
+          <span id="steer-alpha-label">0</span>
+        </div>
+        <div id="steer-result"></div>
+        <div class="panel-head"><span>Generalization test</span>
+          <span class="dim small">a real concept direction shifts UNRELATED prompts the same way</span></div>
+        <div class="controls">
+          <textarea id="steer-batch-prompts" rows="3" style="flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px"
+            placeholder="one prompt per line — e.g.&#10;The food at this restaurant was&#10;My experience with the product was&#10;Overall I think the service was"></textarea>
+          <button id="btn-steer-batch" class="primary">steer all at current α</button>
+        </div>
+        <div id="steer-batch-result"></div>
+      </div>
+    </div>
+
+    <div id="tab-sae" class="tab-body hidden">
+      <div class="controls" style="flex-wrap:wrap">
+        <label>layer</label><code id="sae-layer">(select a block in the tree/graph)</code>
+        <label>expansion</label><input id="sae-exp" value="2" size="2">
+        <label>λ (L1)</label><input id="sae-l1" value="0.005" size="6">
+        <label>steps</label><input id="sae-steps" value="500" size="5">
+        <button id="btn-sae-train" class="primary">▶ train SAE on this layer</button>
+      </div>
+      <div class="note">Real dictionary learning at <b>toy scale</b>: an overcomplete sparse autoencoder
+        (untied weights, decoder columns kept unit-norm, L1 on the code) trained on this layer's
+        activations over a small input batch. It demonstrates the mechanics of the technique used in
+        modern interpretability research — it does not produce publication-grade monosemantic features.</div>
+      <div id="sae-result" class="hidden">
+        <div id="sae-status" class="dim small" style="margin:6px 0"></div>
+        <div id="sae-curve"></div>
+        <div class="controls">
+          <button id="btn-sae-decompose" class="primary">decompose the current forward input</button>
+        </div>
+        <div id="sae-features"></div>
+      </div>
+    </div>
+
+    <div id="tab-profile" class="tab-body hidden">
+      <div class="controls">
+        <button id="btn-profile" class="primary">Profile last forward pass</button>
+        <span class="dim small">latency measured per module call · FLOPs computed from real shapes ·
+          click a row to inspect · use the “time” mode in ⬡ Graph to color nodes by latency</span>
+      </div>
+      <div id="profile-result"></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: inspector -->
+  <section id="detail-panel">
+    <div class="panel-head"><span id="detail-title">Inspector</span></div>
+    <div id="detail-empty" class="dim" style="padding:14px">
+      Select a layer in the architecture tree, or step through a forward pass.
+    </div>
+    <div id="detail-body" class="hidden">
+      <div id="detail-meta"></div>
+      <div id="weights-section">
+        <div class="panel-head"><span>Weights</span><span><select id="param-select"></select></span></div>
+        <div id="weight-view"></div>
+      </div>
+      <div id="activation-section" class="hidden">
+        <div class="panel-head"><span>Activation (this input)</span></div>
+        <div id="activation-view"></div>
+      </div>
+      <div id="grad-section" class="hidden">
+        <div class="panel-head"><span>Gradient</span></div>
+        <div id="grad-view"></div>
+      </div>
+      <div id="analysis-section">
+        <div class="panel-head"><span>🔧 Analysis</span></div>
+        <div id="analysis-controls" style="padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap">
+          <button id="btn-svd">SVD / rank</button>
+          <button id="btn-dead">dead neurons</button>
+          <button id="btn-quant8">int8 sim</button>
+          <button id="btn-quant4">int4 sim</button>
+          <button id="btn-prune">prune sweep</button>
+          <button id="btn-maxact">max-activating</button>
+          <button id="btn-ablate" class="hidden">rank heads (ablation)</button>
+        </div>
+        <div id="analysis-view" style="padding:0 12px 8px"></div>
+      </div>
+      <div id="theory-section">
+        <div class="panel-head"><span>📖 Theory</span></div>
+        <div id="theory-view"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="welcome">
+  <h1>⚡ Model X-Ray</h1>
+  <p>A microscope for real neural networks: upload a model, run a real forward
+     pass on your input, watch the actual tensors flow layer by layer, then run
+     a real backward pass and see exactly how every weight would change.</p>
+  <p class="dim">Load a demo model above to start, paste a HuggingFace model ID,
+     or upload a <code>.safetensors</code> / <code>.pt</code> file.
+     Safetensors is the safe format — raw pickle files can execute code and
+     require the “trust pickle” opt-in.</p>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

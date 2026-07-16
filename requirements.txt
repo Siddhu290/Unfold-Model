@@ -1,0 +1,6 @@
+torch>=2.1
+transformers>=4.36,<4.41
+safetensors
+fastapi>=0.104
+uvicorn[standard]
+python-multipart
